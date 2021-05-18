@@ -1,10 +1,11 @@
 package Daemonise::Plugin::Daemon;
 
+use BSD::Resource qw( getrusage setrlimit RLIMIT_VMEM );
 use Mouse::Role;
+use POSIX qw(strftime SIGTERM SIG_BLOCK SIG_UNBLOCK);
+use Process::SizeLimit::Core;
 
 # ABSTRACT: Daemonise plugin handling PID file and forking
-
-use POSIX qw(strftime SIGTERM SIG_BLOCK SIG_UNBLOCK);
 
 =head1 SYNOPSIS
 
@@ -151,6 +152,43 @@ has 'interval' => (
     default => sub { 5 },
 );
 
+=head2 exit_size
+
+The daemon will terminate after running a loop iteration if its process size exceeds this value in
+bytes. A value of zero will disable this functionality.
+
+The size is checked at the end of the loop, so a process can temporarily use up to C<abort_size>
+bytes, so long as it shrinks back to under C<exit_size> before the check.
+
+=cut
+
+# This is 'rw' only because configure() wants to update it, and should otherwise be considered
+# immutable.
+has exit_size => (is => 'rw', isa => 'Int', default => sub { 1024**3 });
+
+=head2 abort_size
+
+The daemon will terminate immediately if its process size exceeds this value in bytes. A value of
+zero disables this functionality.
+
+This is enforced by using e.g. L<setrlimit(2)> (the exact syscall depends on platform). The Perl
+process has no opportunity to perform cleanup.
+
+=cut
+
+# This is 'rw' only because configure() wants to update it, and should otherwise be considered
+# immutable.
+has abort_size => (is => 'rw', isa => 'Int', default => sub { 1.5 * 1024**3 });
+
+has _size_limit => (is => 'ro', isa => 'Process::SizeLimit::Core', required => 1, lazy_build => 1);
+
+sub _build__size_limit {
+    my $self = shift;
+
+    my $obj = bless {}, 'Process::SizeLimit::Core';
+    $obj;
+}
+
 =head1 SUBROUTINES/METHODS provided
 
 =head2 configure
@@ -162,24 +200,31 @@ after 'configure' => sub {
 
     $self->log("configuring Daemon plugin") if $self->debug;
 
-    unless (exists $self->config->{daemon}
-        and ref $self->config->{daemon} eq 'HASH')
-    {
+    my $config = $self->config->{daemon};
+    unless (defined $config && ref $config eq 'HASH') {
         warn "'daemon' plugin config section missing!";
         return;
     }
 
-    foreach my $key (keys %{ $self->config->{daemon} }) {
-        my $val = $self->config->{daemon}->{$key};
+    $self->_install_config($config);
 
-        # set properties if they exist but don't die if they don't
-        eval { $self->$key($val) };
-        warn "$key not defined as property! $@"
-            if ($@ && $self->debug);
-    }
-
-    return;
+    my $local_config = $config->{ $self->name };
+    $self->_install_config($local_config) if $local_config;
 };
+
+sub _install_config {
+    my ($self, $config) = @_;
+
+    while (my ($key, $value) = each %$config) {
+        next if defined $value && ref $value eq 'HASH';
+
+        if ($self->can($key)) {
+            $self->$key($value);
+        } else {
+            warn "$key not defined as property!" if $self->debug;
+        }
+    }
+}
 
 =head2 log
 
@@ -241,18 +286,46 @@ around 'start' => sub {
     # graph that startup was ok and that we are running now
     $self->graph('hase.' . $self->name, 'running', 1) if $self->can('graph');
 
-    if ($self->loops) {
-        while (1) {
-            { $code->(); }
-        }
+    if ($self->abort_size > 0) {
+
+        # Attempt to set a hard process memory limit, but just log if this fails. There are various
+        # possible reasons for failure, the most typical being that the limit was already lower than
+        # this value.
+        my $limited = setrlimit(RLIMIT_VMEM, $self->abort_size, $self->abort_size);
+        $self->log(sprintf 'Could not limit process size to %d; continuing regardless',
+            $self->abort_size)
+          unless $limited;
     }
-    else {
+
+    my $count  = 0;
+    my $repeat = $self->loops;
+
+    do {
+        $count += 1;
         $code->();
-        $self->stop;
-    }
+        if ($self->exit_size > 0) {
+            my $size = $self->_process_size();
+            if ($size >= $self->exit_size) {
+                $self->log(
+                    sprintf
+'Exiting after %d iteration(s): process size of %d bytes exceeds limit of %d bytes',
+                    $count, $size, $self->exit_size);
+                $self->graph("hase" . $self->name, 'memory_limit_exit', 1) if $self->can('graph');
+                $repeat = 0;
+            }
+        }
+    } while ($repeat);
+    $self->stop;
 
     return;
 };
+
+sub _process_size {
+    my $self = shift;
+
+    my ($size, $share, $unshared) = $self->_size_limit->_check_size();
+    return $size * 1024;
+}
 
 =head2 dont_loop / loop
 
